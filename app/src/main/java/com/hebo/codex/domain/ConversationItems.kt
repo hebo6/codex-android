@@ -62,7 +62,7 @@ internal fun ConversationState.withRestoredConversation(
         if (
             current != null && current.status != ConversationTurnStatus.IN_PROGRESS &&
             current.status == turn.status && turn.detailsState == TurnDetailsState.Unloaded &&
-            turn.items == current.items.summaryItems()
+            turn.items == (current.detailsSummary ?: current.items.summaryItems())
         ) {
             current.copy(error = turn.error)
         } else {
@@ -127,10 +127,21 @@ internal fun ConversationState.withRefreshedConversation(
         agentNickname = merged.agentNickname,
         agentRole = merged.agentRole,
         canAcceptDirectInput = merged.canAcceptDirectInput,
+        accessMode = merged.accessMode,
+        desktopControlAvailable = merged.desktopControlAvailable,
         history = merged.history,
         activeItemKeys = merged.activeItemKeys,
         activeTurnId = merged.activeTurnId,
         isRunning = merged.isRunning,
+        model = merged.model ?: model,
+        serviceTier = merged.serviceTier ?: serviceTier,
+        reasoningEffort = merged.reasoningEffort ?: reasoningEffort,
+        approvalPolicy = merged.approvalPolicy ?: approvalPolicy,
+        approvalsReviewer = merged.approvalsReviewer ?: approvalsReviewer,
+        sandbox = merged.sandbox ?: sandbox,
+        errorMessage = null,
+        pendingRequests = if (merged.isExternalWriter) emptyList() else pendingRequests,
+        runtimeStatus = if (merged.isExternalWriter) RuntimeStatus() else runtimeStatus,
         plan = plan?.takeIf { it.turnId == merged.activeTurnId },
     )
 }

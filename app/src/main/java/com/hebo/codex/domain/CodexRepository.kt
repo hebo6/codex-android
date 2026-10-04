@@ -501,6 +501,25 @@ class CodexRepository(
         return conversation
     }
 
+    suspend fun refreshConversation(serverId: String, threadId: String) {
+        conversationMutex.withLock {
+            val key = ConversationKey(serverId, threadId)
+            refreshConversation(key, requireConversation(serverId, threadId))
+        }
+        requestRuntimeQueueRefresh(ConversationKey(serverId, threadId))
+    }
+
+    internal suspend fun syncExternalConversation(serverId: String, threadId: String) {
+        val key = ConversationKey(serverId, threadId)
+        conversationMutex.withLock {
+            val state = requireConversation(serverId, threadId)
+            // Manual refresh/reconnect may have already restored the live stream.
+            if (!state.value.isExternalWriter) return
+            refreshConversation(key, state, failOnError = true, reportErrors = false)
+        }
+        requestRuntimeQueueRefresh(key)
+    }
+
     suspend fun loadOlderConversationTurns(serverId: String, threadId: String): Boolean {
         val key = ConversationKey(serverId, threadId)
         val state = requireConversation(serverId, threadId)
@@ -573,6 +592,8 @@ class CodexRepository(
         val text = input.filterIsInstance<UserInputPart.Text>().joinToString("\n") { it.text }.trim()
         require(text.isNotEmpty() || input.any { it !is UserInputPart.Text }) { "消息内容不能为空" }
         val state = requireConversation(serverId, threadId)
+        state.value.requireWritable()
+        val targetApi = writableApi(serverId, threadId)
         val activeTurnId = state.value.activeTurnId
         val clientId = UUID.randomUUID().toString()
         val messageTitle = input.conversationTitle()
@@ -587,9 +608,9 @@ class CodexRepository(
 
         try {
             val result = if (activeTurnId == null) {
-                api(serverId).startTurn(threadId, clientId, input, options)
+                targetApi.startTurn(threadId, clientId, input, options)
             } else {
-                api(serverId).steerTurn(threadId, activeTurnId, clientId, input)
+                targetApi.steerTurn(threadId, activeTurnId, clientId, input)
             }
             val turnId = if (activeTurnId == null) {
                 result.requiredObject("turn").requiredString("id")
@@ -611,12 +632,30 @@ class CodexRepository(
         }
     }
 
+    suspend fun sendDesktopMessage(serverId: String, threadId: String, text: String) {
+        require(text.isNotBlank()) { "消息内容不能为空" }
+        val state = requireConversation(serverId, threadId)
+        check(state.value.canSendToDesktop) { state.value.viewOnlyMessage ?: "电脑端连接已失效，请刷新会话" }
+        val targetApi = api(serverId)
+        // Reconnection may restore local ownership or lose the desktop owner.
+        check(state.value.canSendToDesktop) { "会话连接已变化，请刷新后重试" }
+        check(!state.value.isRunning) { "电脑正在处理此会话，请完成后再发送" }
+        val result = targetApi.sendDesktopMessage(threadId, UUID.randomUUID().toString(), text)
+        state.updateState { current ->
+            current.reduceConversationEvent(
+                ConversationEvent.TurnStarted(result.requiredObject("turn").requiredString("id")),
+            )
+        }
+        // History is read from the original thread; the companion owns no writer.
+        // Do not retry a failed delivery or clear drafts on an unconfirmed result.
+    }
+
     suspend fun queueInput(serverId: String, threadId: String, input: List<UserInputPart>) {
         require(input.isNotEmpty()) { "消息内容不能为空" }
         val conversation = requireConversation(serverId, threadId).value
-        check(!conversation.isViewOnly) { "此会话当前仅可查看" }
+        conversation.requireWritable()
         try {
-            api(serverId).queueInput(threadId, UUID.randomUUID().toString(), input)
+            writableApi(serverId, threadId).queueInput(threadId, UUID.randomUUID().toString(), input)
         } finally {
             requestRuntimeQueueRefresh(ConversationKey(serverId, threadId))
         }
@@ -624,9 +663,9 @@ class CodexRepository(
 
     suspend fun deleteQueuedInput(serverId: String, threadId: String, entryId: String): Boolean {
         val state = requireConversation(serverId, threadId)
-        check(!state.value.isViewOnly) { "此会话当前仅可查看" }
+        state.value.requireWritable()
         try {
-            val deleted = api(serverId).deleteQueuedInput(threadId, entryId)
+            val deleted = writableApi(serverId, threadId).deleteQueuedInput(threadId, entryId)
             if (deleted) state.updateState { current ->
                 current.copy(runtimeStatus = current.runtimeStatus.copy(
                     queue = current.runtimeStatus.queue?.let { queue ->
@@ -647,11 +686,13 @@ class CodexRepository(
         val normalized = command.trim()
         require(normalized.isNotEmpty()) { "Shell 命令不能为空" }
         val state = requireConversation(serverId, threadId)
+        state.value.requireWritable()
+        val targetApi = writableApi(serverId, threadId)
         require(!state.value.isRunning) { "当前任务结束后才能执行 Shell 命令" }
         state.updateState { current -> current.copy(isRunning = true, errorMessage = null) }
         setThreadAttention(serverId, threadId, ThreadAttention.RUNNING)
         try {
-            api(serverId).runShellCommand(threadId, normalized)
+            targetApi.runShellCommand(threadId, normalized)
         } catch (error: Throwable) {
             state.updateState { current ->
                 if (current.activeTurnId == null) {
@@ -669,8 +710,9 @@ class CodexRepository(
     }
 
     suspend fun terminateBackgroundTerminal(serverId: String, threadId: String, processId: String) {
+        requireConversation(serverId, threadId).value.requireWritable()
         require(processId.isNotBlank()) { "后台命令进程 ID 不能为空" }
-        check(api(serverId).terminateBackgroundTerminal(threadId, processId)) {
+        check(writableApi(serverId, threadId).terminateBackgroundTerminal(threadId, processId)) {
             "命令已经结束或无法终止"
         }
         val key = ConversationKey(serverId, threadId)
@@ -680,8 +722,10 @@ class CodexRepository(
 
     suspend fun interrupt(serverId: String, threadId: String) {
         val state = requireConversation(serverId, threadId)
+        state.value.requireWritable()
+        val targetApi = writableApi(serverId, threadId)
         val turnId = state.value.activeTurnId ?: return
-        api(serverId).interruptTurn(threadId, turnId)
+        targetApi.interruptTurn(threadId, turnId)
     }
 
     suspend fun forkConversation(serverId: String, threadId: String, lastTurnId: String? = null): String {
@@ -693,9 +737,10 @@ class CodexRepository(
     }
 
     suspend fun renameConversation(serverId: String, threadId: String, name: String) {
+        checkConversationWritableIfOpen(serverId, threadId)
         val normalized = name.trim()
         require(normalized.isNotEmpty()) { "会话名称不能为空" }
-        api(serverId).request(
+        writableApi(serverId, threadId).request(
             StableRpcMethod.THREAD_NAME_SET,
             buildJsonObject {
                 put("threadId", threadId)
@@ -707,7 +752,8 @@ class CodexRepository(
     }
 
     suspend fun archiveConversation(serverId: String, threadId: String) {
-        api(serverId).request(
+        checkConversationWritableIfOpen(serverId, threadId)
+        writableApi(serverId, threadId).request(
             StableRpcMethod.THREAD_ARCHIVE,
             buildJsonObject { put("threadId", threadId) },
         )
@@ -721,7 +767,8 @@ class CodexRepository(
     }
 
     suspend fun unarchiveConversation(serverId: String, threadId: String) {
-        api(serverId).request(
+        checkConversationWritableIfOpen(serverId, threadId)
+        writableApi(serverId, threadId).request(
             StableRpcMethod.THREAD_UNARCHIVE,
             buildJsonObject { put("threadId", threadId) },
         )
@@ -729,7 +776,8 @@ class CodexRepository(
     }
 
     suspend fun deleteConversation(serverId: String, threadId: String) {
-        api(serverId).request(
+        checkConversationWritableIfOpen(serverId, threadId)
+        writableApi(serverId, threadId).request(
             StableRpcMethod.THREAD_DELETE,
             buildJsonObject { put("threadId", threadId) },
         )
@@ -744,7 +792,8 @@ class CodexRepository(
     }
 
     suspend fun compactConversation(serverId: String, threadId: String) {
-        api(serverId).request(
+        requireConversation(serverId, threadId).value.requireWritable()
+        writableApi(serverId, threadId).request(
             StableRpcMethod.THREAD_COMPACT,
             buildJsonObject { put("threadId", threadId) },
         )
@@ -765,7 +814,8 @@ class CodexRepository(
         target: ReviewTarget,
         delivery: ReviewDelivery,
     ): String {
-        val response = api(serverId).review(threadId, target, delivery)
+        requireConversation(serverId, threadId).value.requireWritable()
+        val response = writableApi(serverId, threadId).review(threadId, target, delivery)
         return response.requiredString("reviewThreadId")
     }
 
@@ -791,7 +841,8 @@ class CodexRepository(
         tokenBudget: Long? = null,
     ): ThreadGoal {
         require(objective.isNotBlank()) { "目标不能为空" }
-        val targetApi = api(serverId)
+        requireConversation(serverId, threadId).value.requireWritable()
+        val targetApi = writableApi(serverId, threadId)
         val key = ConversationKey(serverId, threadId)
         val revisions = goalRevisions.computeIfAbsent(key) { AtomicLong() }
         val revision = revisions.incrementAndGet()
@@ -810,7 +861,8 @@ class CodexRepository(
     }
 
     suspend fun clearGoal(serverId: String, threadId: String) {
-        val targetApi = api(serverId)
+        requireConversation(serverId, threadId).value.requireWritable()
+        val targetApi = writableApi(serverId, threadId)
         val key = ConversationKey(serverId, threadId)
         val revisions = goalRevisions.computeIfAbsent(key) { AtomicLong() }
         val revision = revisions.incrementAndGet()
@@ -853,7 +905,7 @@ class CodexRepository(
         if (conversationLeases.isHeld(key)) return
         val conversation = conversations[key] ?: return
         if (conversation.value.requiresRuntimeRetention) return
-        runSuspendCatching {
+        if (!conversation.value.isExternalWriter) runSuspendCatching {
             api(key.serverId).request(
                 StableRpcMethod.THREAD_UNSUBSCRIBE,
                 buildJsonObject { put("threadId", key.threadId) },
@@ -1044,6 +1096,14 @@ class CodexRepository(
         retryFailed: Boolean = false,
     ): AppServerApi = AppServerApi(connections.connection(serverId, retryFailed).connection)
 
+    private suspend fun writableApi(serverId: String, threadId: String): AppServerApi {
+        checkConversationWritableIfOpen(serverId, threadId)
+        val targetApi = api(serverId)
+        // Connecting can restore this conversation in external-writer mode.
+        checkConversationWritableIfOpen(serverId, threadId)
+        return targetApi
+    }
+
     private suspend fun establishConnection(serverId: String): ManagedConnection {
         val server = awaitServer(serverId)
         val connection = clientFactory.create(
@@ -1131,11 +1191,14 @@ class CodexRepository(
                         current.withRefreshedConversation(snapshot.toConversationState(server))
                     }
                     removeRestoredItemUpdates(key, state.value)
+                    clearExternalWriterRuntime(key, state.value)
                     completeBackgroundTerminalRefresh(
                         key = key,
                         state = state,
                         buffer = backgroundRefresh,
-                        result = runSuspendCatching { loadAllBackgroundTerminals(api, key.threadId) }
+                        result = (if (snapshot.accessMode == ConversationAccessMode.EXTERNAL_WRITER) {
+                            Result.success(emptyList())
+                        } else runSuspendCatching { loadAllBackgroundTerminals(api, key.threadId) })
                             .onFailure { error ->
                                 if (error !is SocketTimeoutException) {
                                     diagnostics.warning("restore_background_terminals_failed", error)
@@ -1475,6 +1538,16 @@ class CodexRepository(
     private fun requireConversation(serverId: String, threadId: String): MutableStateFlow<ConversationState> =
         conversations[ConversationKey(serverId, threadId)] ?: error("会话尚未打开")
 
+    private fun checkConversationWritableIfOpen(serverId: String, threadId: String) {
+        conversations[ConversationKey(serverId, threadId)]?.value?.requireWritable()
+    }
+
+    private fun clearExternalWriterRuntime(key: ConversationKey, state: ConversationState) {
+        if (!state.isExternalWriter) return
+        runtimeQueueRefreshes[key]?.revision?.incrementAndGet()
+        removePendingRequests(key.serverId, key.threadId)
+    }
+
     suspend fun loadConversationTurnDetails(serverId: String, threadId: String, turnId: String) {
         requireConversation(serverId, threadId).loadTurnDetails(turnId) {
             loadAllTurnItems(api(serverId), threadId, turnId)
@@ -1484,15 +1557,16 @@ class CodexRepository(
     private suspend fun resumeConversation(
         key: ConversationKey,
         api: AppServerApi,
-    ): ThreadSnapshot {
+    ): ConversationResumeResult {
         pendingResumeGoalSnapshots.add(key)
         return try {
-            val snapshot = ProtocolMapper.resumedThreadSnapshot(api.resumeThread(key.threadId))
-            snapshot.copy(
-                turns = loadResumedTurns(snapshot.turns) { turnId ->
-                    loadAllTurnItems(api, key.threadId, turnId)
-                },
-            )
+            resumeOrReadConversation(api, key.threadId) { turnId ->
+                loadAllTurnItems(api, key.threadId, turnId)
+            }.also { result ->
+                if (result.accessMode == ConversationAccessMode.EXTERNAL_WRITER) {
+                    pendingResumeGoalSnapshots.remove(key)
+                }
+            }
         } catch (error: Throwable) {
             pendingResumeGoalSnapshots.remove(key)
             throw error
@@ -1503,20 +1577,22 @@ class CodexRepository(
         key: ConversationKey,
         state: MutableStateFlow<ConversationState>,
         failOnError: Boolean = false,
+        reportErrors: Boolean = true,
     ) {
         val buffer = beginConversationEventBuffer(key)
         val backgroundRefresh = beginBackgroundTerminalRefresh(key)
         try {
             val targetApi = api(key.serverId)
             val snapshot = resumeConversation(key, targetApi)
-            val backgroundTerminals = runSuspendCatching {
-                loadAllBackgroundTerminals(targetApi, key.threadId)
-            }
+            val backgroundTerminals = if (snapshot.accessMode == ConversationAccessMode.EXTERNAL_WRITER) {
+                Result.success(emptyList())
+            } else runSuspendCatching { loadAllBackgroundTerminals(targetApi, key.threadId) }
             val server = awaitServer(key.serverId)
             completeConversationRefresh(key, state, buffer) { current ->
                 current.withRefreshedConversation(snapshot.toConversationState(server))
             }
             removeRestoredItemUpdates(key, state.value)
+            clearExternalWriterRuntime(key, state.value)
             completeBackgroundTerminalRefresh(
                 key = key,
                 state = state,
@@ -1530,7 +1606,7 @@ class CodexRepository(
         } catch (error: Throwable) {
             cancelBackgroundTerminalRefresh(key, backgroundRefresh)
             completeConversationRefresh(key, state, buffer) { current ->
-                current.copy(errorMessage = error.toUserFacingError("刷新会话失败"))
+                if (reportErrors) current.copy(errorMessage = error.toUserFacingError("刷新会话失败")) else current
             }
             if (failOnError) throw error
         }
@@ -1558,7 +1634,7 @@ class CodexRepository(
     }
 
     private fun requestRuntimeQueueRefresh(key: ConversationKey) {
-        if (!conversations.containsKey(key)) return
+        if (conversations[key]?.value?.isExternalWriter != false) return
         val refresh = runtimeQueueRefreshes.computeIfAbsent(key) { RuntimeQueueRefresh() }
         val revision = refresh.revision.incrementAndGet()
         applicationScope.launch {
@@ -1584,7 +1660,7 @@ class CodexRepository(
                 // 通知触发了更新读取或连接已断开时，丢弃此请求的旧结果
                 if (revision != refresh.revision.get()) return@withLock
                 conversations[key]?.updateState { current ->
-                    if (revision != refresh.revision.get()) return@updateState current
+                    if (revision != refresh.revision.get() || current.isExternalWriter) return@updateState current
                     val queue = result.fold(
                         onSuccess = { RuntimeInputQueue(entries = it) },
                         onFailure = {
@@ -1734,7 +1810,19 @@ class CodexRepository(
                 .first { it != null }
         } ?: error("服务器不存在")
 
-    private fun com.hebo.codex.data.remote.ThreadSnapshot.toConversationState(
+    private fun ConversationResumeResult.toConversationState(profile: ServerProfile): ConversationState =
+        snapshot.toConversationState(profile).let { state ->
+            state.copy(
+                accessMode = accessMode,
+                desktopControlAvailable = desktopControlAvailable,
+                // thread/read reports notLoaded for another app-server's thread;
+                // the paginated history still identifies its in-progress turn.
+                isRunning = state.isRunning ||
+                    (accessMode == ConversationAccessMode.EXTERNAL_WRITER && state.activeTurnId != null),
+            )
+        }
+
+    private fun ThreadSnapshot.toConversationState(
         profile: ServerProfile,
     ): ConversationState {
         return ConversationState(
@@ -1825,6 +1913,7 @@ class CodexRepository(
         key: String,
         result: JsonObject,
     ) {
+        requireConversation(serverId, threadId).value.requireWritable()
         val route = pendingRequestRoutes[key] ?: error("服务端请求已失效")
         check(route.threadId == threadId) { "服务端请求不属于当前会话" }
         val connection = connections.current(serverId)?.connection ?: error("服务器未连接")

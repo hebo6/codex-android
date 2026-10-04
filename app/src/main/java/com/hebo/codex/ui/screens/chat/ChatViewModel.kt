@@ -31,6 +31,7 @@ import com.hebo.codex.domain.UserFacingError
 import com.hebo.codex.domain.newDraftRevision
 import com.hebo.codex.domain.quickPhraseInput
 import com.hebo.codex.domain.loadInputResources
+import com.hebo.codex.domain.monitorExternalConversation
 import com.hebo.codex.util.runSuspendCatching
 import com.hebo.codex.util.toUserFacingError
 import kotlinx.coroutines.CancellationException
@@ -42,6 +43,8 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -85,6 +88,7 @@ data class ChatUiState(
     val queueFeedback: String? = null,
     val terminatingBackgroundProcessIds: Set<String> = emptySet(),
     val forkRequest: ForkRequest? = null,
+    val externalSyncError: UserFacingError? = null,
     val screenError: UserFacingError? = null,
 )
 
@@ -115,6 +119,7 @@ class ChatViewModel(
     val events = mutableEvents.receiveAsFlow()
     private var draftInitialized = false
     private var conversationJob: Job? = null
+    private var conversationRefreshJob: Job? = null
     private var conversationReady: CompletableDeferred<Unit>? = null
     private var subAgentsJob: Job? = null
     private var modelListJob: Job? = null
@@ -168,10 +173,25 @@ class ChatViewModel(
                 runSuspendCatching { queueWithdrawalCoordinator.loadDraft(draftKey) }
             }
             var conversationOpened = false
+            var externalSyncJob: Job? = null
             try {
                 val conversation = repository.openConversation(serverId, threadId)
                 conversationOpened = true
                 ready.complete(Unit)
+                externalSyncJob = launch {
+                    monitorExternalConversation(
+                        conversation = conversation,
+                        connected = repository.connectionStatuses
+                            .map { it[serverId] is ConnectionStatus.Connected }
+                            .distinctUntilChanged(),
+                        refresh = { repository.syncExternalConversation(serverId, threadId) },
+                        onError = { error ->
+                            mutableState.update {
+                                it.copy(externalSyncError = error?.toUserFacingError("暂时无法更新历史，稍后自动重试"))
+                            }
+                        },
+                    )
+                }
                 conversation.collectLatest { value ->
                     val initialDraft = if (draftInitialized) {
                         null
@@ -186,6 +206,7 @@ class ChatViewModel(
                             goal = if (value.goalLoaded) value.goal else it.goal,
                             draft = initialDraft ?: it.draft,
                             isLoading = false,
+                            externalSyncError = it.externalSyncError.takeIf { value.isExternalWriter },
                             screenError = restoredResult.exceptionOrNull()
                                 ?.toUserFacingError("无法恢复草稿")
                                 ?: it.screenError,
@@ -202,6 +223,7 @@ class ChatViewModel(
                     )
                 }
             } finally {
+                externalSyncJob?.cancel()
                 ready.cancel()
                 if (conversationOpened) repository.releaseConversation(serverId, threadId)
             }
@@ -209,6 +231,8 @@ class ChatViewModel(
     }
 
     fun pauseConversation() {
+        conversationRefreshJob?.cancel()
+        conversationRefreshJob = null
         conversationReady?.cancel()
         conversationReady = null
         conversationJob?.cancel()
@@ -221,6 +245,15 @@ class ChatViewModel(
     }
 
     fun refreshSubAgents() = repository.refreshSubAgents(serverId, threadId)
+
+    fun refreshConversation() {
+        if (conversationRefreshJob?.isActive == true) return
+        conversationRefreshJob = viewModelScope.launch {
+            runSuspendCatching { repository.refreshConversation(serverId, threadId) }
+                .onSuccess { mutableState.update { it.copy(externalSyncError = null) } }
+                .onFailure(::showError)
+        }
+    }
 
     fun refreshRuntimeQueue() = repository.refreshRuntimeQueue(serverId, threadId)
 
@@ -330,6 +363,22 @@ class ChatViewModel(
         if (input.isEmpty()) return
         submitDraft(draft) {
             repository.sendMessage(serverId, threadId, input, draft.options)
+        }
+    }
+
+    fun sendDesktopDraft() {
+        if (queueBusy) return
+        val current = mutableState.value
+        if (current.conversation?.canSendToDesktop != true || current.conversation.isRunning ||
+            current.isSendingDraft || current.connectionStatus !is ConnectionStatus.Connected) return
+        val draft = current.draft
+        if (draft.message.isBlank()) return
+        if (draft.attachments.isNotEmpty()) {
+            reportInputError(IllegalArgumentException("电脑端续聊目前仅支持文字，请先移除草稿附件"))
+            return
+        }
+        submitDraft(draft, failureFeedback = "发送未确认，请检查原对话后再重试") {
+            repository.sendDesktopMessage(serverId, threadId, draft.message)
         }
     }
 
@@ -452,6 +501,7 @@ class ChatViewModel(
     }
 
     fun interrupt() {
+        if (mutableState.value.conversation?.isViewOnly == true) return
         viewModelScope.launch {
             runSuspendCatching { repository.interrupt(serverId, threadId) }
                 .onFailure(::showError)
@@ -460,6 +510,7 @@ class ChatViewModel(
 
     fun terminateBackgroundCommand(processId: String) {
         val current = mutableState.value
+        if (current.conversation?.isViewOnly == true) return
         if (processId in current.terminatingBackgroundProcessIds) return
         mutableState.update {
             it.copy(
@@ -518,6 +569,7 @@ class ChatViewModel(
     }
 
     fun rename(name: String) {
+        if (mutableState.value.conversation?.isViewOnly == true) return
         viewModelScope.launch {
             runSuspendCatching {
                 repository.renameConversation(serverId, threadId, name)

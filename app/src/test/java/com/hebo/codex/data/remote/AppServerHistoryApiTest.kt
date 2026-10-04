@@ -54,11 +54,12 @@ class AppServerHistoryApiTest {
             val api = AppServerApi(connection)
 
             api.resumeThread("thread-1")
+            api.readThread("thread-1")
             api.listThreadTurns("thread-1", cursor = "older-turns")
             api.listThreadItems("thread-1", "turn-1", cursor = "next-items")
 
             assertEquals(
-                listOf("thread/resume", "thread/turns/list", "thread/items/list"),
+                listOf("thread/resume", "thread/read", "thread/turns/list", "thread/items/list"),
                 requests.map { it.requiredString("method") },
             )
             assertEquals(
@@ -66,12 +67,16 @@ class AppServerHistoryApiTest {
                 requests[0].requiredObject("params"),
             )
             assertEquals(
-                json("""{"threadId":"thread-1","cursor":"older-turns","limit":25,"sortDirection":"desc","itemsView":"summary"}"""),
+                json("""{"threadId":"thread-1","includeTurns":false}"""),
                 requests[1].requiredObject("params"),
             )
             assertEquals(
-                json("""{"threadId":"thread-1","turnId":"turn-1","limit":100,"sortDirection":"asc","cursor":"next-items"}"""),
+                json("""{"threadId":"thread-1","cursor":"older-turns","limit":25,"sortDirection":"desc","itemsView":"summary"}"""),
                 requests[2].requiredObject("params"),
+            )
+            assertEquals(
+                json("""{"threadId":"thread-1","turnId":"turn-1","limit":100,"sortDirection":"asc","cursor":"next-items"}"""),
+                requests[3].requiredObject("params"),
             )
         } finally {
             connection.close()

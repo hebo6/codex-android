@@ -329,6 +329,7 @@ fun ChatScreen(
     val scrollScope = rememberCoroutineScope()
     var bottomControlsHeightPx by remember { mutableStateOf(0) }
     var dialog by remember { mutableStateOf<ChatDialog?>(null) }
+    var forkFromTurnId by remember { mutableStateOf<String?>(null) }
     var showTurnOptions by remember { mutableStateOf(false) }
     var activeRequestKey by rememberSaveable(conversation?.threadId) { mutableStateOf<String?>(null) }
     var shownNoticeId by rememberSaveable(conversation?.threadId) { mutableStateOf<String?>(null) }
@@ -344,7 +345,8 @@ fun ChatScreen(
         focusManager.clearFocus()
         imagePreviewSource = source
     }
-    val activeRequest = conversation?.pendingRequests?.firstOrNull { it.requestKey == activeRequestKey }
+    val activeRequest = conversation?.takeUnless { it.isViewOnly }
+        ?.pendingRequests?.firstOrNull { it.requestKey == activeRequestKey }
     val density = LocalDensity.current
     val showLinkError: (String) -> Unit = { message ->
         noticeState.showError(UserFacingError(message))
@@ -502,7 +504,10 @@ fun ChatScreen(
                 actions = ConversationHeaderActions(
                     onNewTask = { conversation?.let { onNewTask(it.cwd) } },
                     onRename = { dialog = ChatDialog.Rename },
-                    onFork = { dialog = ChatDialog.Fork },
+                    onFork = {
+                        forkFromTurnId = null
+                        dialog = ChatDialog.Fork
+                    },
                     onOpenGoal = { dialog = ChatDialog.Goal },
                 ),
                 onRefreshRateLimits = onRefreshRateLimits,
@@ -581,7 +586,10 @@ fun ChatScreen(
                                 ForkFromTurnAction(
                                     turn = turn,
                                     forkRequest = state.forkRequest,
-                                    onFork = viewModel::fork,
+                                    onFork = {
+                                        forkFromTurnId = it
+                                        dialog = ChatDialog.Fork
+                                    },
                                 )
                             }
                         }
@@ -631,7 +639,7 @@ fun ChatScreen(
                             .fillMaxWidth()
                             .onSizeChanged { bottomControlsHeightPx = it.height },
                     ) {
-                        conversation.pendingRequests.firstOrNull()?.let { request ->
+                        conversation.pendingRequests.firstOrNull()?.takeUnless { conversation.isViewOnly }?.let { request ->
                             PendingRequestBanner(
                                 request = request,
                                 requestCount = conversation.pendingRequests.size,
@@ -644,7 +652,7 @@ fun ChatScreen(
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
                                 Text(
-                                    if (conversation.isViewOnly) "子代理由父会话控制" else "子代理会话",
+                                    if (conversation.canAcceptDirectInput == false) "子代理由父会话控制" else "子代理会话",
                                     modifier = Modifier.weight(1f),
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -654,13 +662,72 @@ fun ChatScreen(
                                 }
                             }
                         }
-                        if (conversation.isViewOnly && conversation.parentThreadId == null) {
-                            Text(
-                                "此会话当前仅可查看",
-                                modifier = Modifier.padding(16.dp),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
+                        if (conversation.isExternalWriter ||
+                            (conversation.isViewOnly && conversation.parentThreadId == null)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    requireNotNull(conversation.viewOnlyMessage),
+                                    modifier = Modifier.weight(1f),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                if (conversation.isExternalWriter) {
+                                    TextButton(
+                                        onClick = viewModel::refreshConversation,
+                                        enabled = state.connectionStatus is ConnectionStatus.Connected,
+                                    ) { Text(if (conversation.canSendToDesktop) "刷新" else "尝试继续") }
+                                }
+                            }
+                        }
+                        if (conversation.isExternalWriter) {
+                            state.externalSyncError?.let { error ->
+                                Text(
+                                    error.summary,
+                                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.error,
+                                )
+                            }
+                            if (conversation.canAcceptDirectInput != false) {
+                                OutlinedTextField(
+                                    value = state.draft.message,
+                                    onValueChange = viewModel::updateDraftMessage,
+                                    enabled = state.queueOperationId == null && !state.isSendingDraft,
+                                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                                    label = { Text(if (conversation.canSendToDesktop) "在原对话中继续" else "此会话的草稿") },
+                                    supportingText = { Text(
+                                        if (conversation.canSendToDesktop) {
+                                            if (conversation.isRunning) "电脑正在处理，完成后可发送" else "发送文字给电脑端，沿用原会话设置"
+                                        } else "仅保存草稿；恢复发送后需手动发送，不会创建新对话",
+                                    ) },
+                                    minLines = 1,
+                                    maxLines = 3,
+                                )
+                                if (conversation.canSendToDesktop) {
+                                    if (state.draft.attachments.isNotEmpty()) {
+                                        TextButton(
+                                            onClick = { state.draft.attachments.forEach { viewModel.removeDraftAttachment(it.id) } },
+                                            enabled = !state.isSendingDraft && state.queueOperationId == null,
+                                            modifier = Modifier.padding(horizontal = 16.dp),
+                                        ) { Text("移除草稿附件（${state.draft.attachments.size}），仅发送文字") }
+                                    }
+                                    TextButton(
+                                        onClick = {
+                                            pagingController.onSubmission()
+                                            viewModel.sendDesktopDraft()
+                                        },
+                                        enabled = !conversation.isRunning && !state.isSendingDraft &&
+                                            state.draft.message.isNotBlank() &&
+                                            state.draft.attachments.isEmpty() &&
+                                            state.connectionStatus is ConnectionStatus.Connected,
+                                        modifier = Modifier.padding(horizontal = 16.dp),
+                                    ) { Text(if (state.isSendingDraft) "正在发送" else "发送到原对话") }
+                                }
+                            }
                         }
                         ConversationAccessoryPanels(
                             conversation = if (conversation.goalLoaded) conversation else conversation.copy(goal = state.goal),
@@ -780,6 +847,7 @@ fun ChatScreen(
 
         ChatDialog.Fork -> ForkConversationSheet(
             turns = forkTurns,
+            initialLastTurnId = forkFromTurnId,
             isRunning = conversation?.isRunning == true,
             forkRequest = state.forkRequest,
             onDismiss = { dialog = null },
@@ -833,8 +901,8 @@ fun ChatScreen(
             } else {
                 ActivityDetailsActions(
                     isRunning = conversation.isRunning && !conversation.isViewOnly,
-                    pendingRequest = conversation.pendingRequests.firstOrNull(),
-                    pendingRequestCount = conversation.pendingRequests.size,
+                    pendingRequest = conversation.pendingRequests.firstOrNull()?.takeUnless { conversation.isViewOnly },
+                    pendingRequestCount = if (conversation.isViewOnly) 0 else conversation.pendingRequests.size,
                     onStop = viewModel::interrupt,
                     onOpenPendingRequest = { activeRequestKey = it },
                 )
@@ -1130,7 +1198,7 @@ internal fun ConversationFloatingHeader(
                                         },
                                     )
                                 }
-                                ChatActionMenuItem(
+                                if (conversation?.isViewOnly != true) ChatActionMenuItem(
                                     text = "重命名",
                                     icon = { Icon(Icons.Rounded.Edit, contentDescription = null) },
                                     onClick = {
@@ -1278,7 +1346,7 @@ private fun ForkFromTurnAction(
                 )
             }
             Spacer(Modifier.width(6.dp))
-            Text(if (isCreating) "正在创建…" else "从这里继续")
+            Text(if (isCreating) "正在创建…" else "分叉为新对话")
         }
     }
 }
@@ -3034,14 +3102,15 @@ private fun RenameConversationDialog(
 @Composable
 private fun ForkConversationSheet(
     turns: List<ForkTurn>,
+    initialLastTurnId: String?,
     isRunning: Boolean,
     forkRequest: ForkRequest?,
     onDismiss: () -> Unit,
     onFork: (String?) -> Unit,
 ) {
     val canForkLatest = !isRunning
-    var lastTurnId by rememberSaveable(turns, canForkLatest) {
-        mutableStateOf(if (canForkLatest) null else turns.lastOrNull()?.turnId)
+    var lastTurnId by rememberSaveable(initialLastTurnId) {
+        mutableStateOf(initialLastTurnId ?: if (canForkLatest) null else turns.lastOrNull()?.turnId)
     }
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -3057,13 +3126,13 @@ private fun ForkConversationSheet(
         ) {
             Text("分叉会话", style = MaterialTheme.typography.titleLarge)
             Text(
-                "选择新会话包含的最后一个回合",
+                "这会创建独立的新对话，后续消息不会追加到原会话。选择新对话包含的最后一个回合。",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             if (canForkLatest) {
                 ForkSelectionCard(
-                    title = "从最新状态继续",
+                    title = "复制最新状态",
                     supportingText = "包含当前会话的全部已完成回合",
                     selected = lastTurnId == null,
                     onClick = { lastTurnId = null },
@@ -3097,10 +3166,11 @@ private fun ForkConversationSheet(
             }
             Button(
                 onClick = { onFork(lastTurnId) },
-                enabled = forkRequest == null && (lastTurnId != null || canForkLatest),
+                enabled = forkRequest == null &&
+                    (lastTurnId?.let { id -> turns.any { it.turnId == id } } ?: canForkLatest),
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Text("创建并打开")
+                Text("创建并打开新对话")
             }
             TextButton(
                 onClick = onDismiss,

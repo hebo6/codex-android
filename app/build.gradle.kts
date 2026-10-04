@@ -1,9 +1,29 @@
+import org.gradle.api.file.ConfigurableFileCollection
+import org.gradle.api.tasks.Classpath
+import org.gradle.api.tasks.testing.Test
+import org.gradle.process.CommandLineArgumentProvider
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.kotlin.serialization)
     alias(libs.plugins.ksp)
     alias(libs.plugins.room)
+}
+
+val mockitoAgent = configurations.create("mockitoAgent")
+
+abstract class MockitoAgentProvider : CommandLineArgumentProvider {
+    @get:Classpath
+    abstract val agentJar: ConfigurableFileCollection
+
+    override fun asArguments(): List<String> = listOf("-javaagent:${agentJar.asPath}")
+}
+
+tasks.withType<Test>().configureEach {
+    jvmArgumentProviders.add(objects.newInstance<MockitoAgentProvider>().apply {
+        agentJar.from(mockitoAgent)
+    })
 }
 
 val releaseSigningEnabled = providers.gradleProperty("releaseSigning").orNull == "true"
@@ -102,6 +122,8 @@ dependencies {
     debugImplementation(libs.androidx.compose.ui.tooling)
 
     testImplementation(libs.junit)
+    testImplementation(libs.mockito.core)
+    mockitoAgent(libs.mockito.core) { isTransitive = false }
     testImplementation(libs.kotlinx.coroutines.test)
 
     ksp(libs.androidx.room.compiler)
