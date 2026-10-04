@@ -33,7 +33,9 @@ class ConversationTurnDetailsTest {
 
         assertEquals(listOf("running"), reads)
         assertEquals(
-            listOf(older, running.copy(items = runningItems, detailsState = TurnDetailsState.Loaded), newest),
+            listOf(older, running.copy(
+                items = runningItems, detailsState = TurnDetailsState.Loaded, detailsSummary = running.items,
+            ), newest),
             turns,
         )
     }
@@ -169,6 +171,92 @@ class ConversationTurnDetailsTest {
 
         val restored = loaded.withRestoredConversation(summary)
         assertEquals(loaded.history, restored.history)
+    }
+
+    @Test
+    fun `相同服务端摘要不会反复加载包含中间回复的详情`() = runTest {
+        val user = ConversationItem.UserMessage("user", "turn", listOf(UserMessagePart.Text("问题")))
+        val commentary = answer.copy(phase = AgentMessagePhase.COMMENTARY, text = "正在处理")
+        val state = state()
+        val summary = state.value.copy(
+            accessMode = ConversationAccessMode.EXTERNAL_WRITER,
+            history = ConversationHistory(listOf(ConversationTurn(
+                "turn", ConversationTurnStatus.INTERRUPTED, listOf(user), TurnDetailsState.Unloaded,
+            ))),
+        )
+        state.value = summary
+        var reads = 0
+        val details = listOf(user, commentary, command)
+        repeat(3) {
+            state.loadTurnDetails("turn") { reads++; details }
+            state.value = state.value.withRefreshedConversation(summary)
+            assertEquals(TurnDetailsState.Loaded, state.turn.detailsState)
+            assertEquals(details, state.turn.items)
+        }
+        assertEquals(1, reads)
+    }
+
+    @Test
+    fun `空摘要加载的异步回复不会让相同摘要使缓存失效`() = runTest {
+        val state = state()
+        state.value = state.value.copy(history = ConversationHistory(listOf(
+            state.turn.copy(items = emptyList()),
+        )))
+        val summary = state.value
+        val question = answer.copy(delivery = AgentMessageDelivery.ASYNC)
+        state.loadTurnDetails("turn") { listOf(question, command) }
+        val loaded = state.value
+        repeat(3) { state.value = state.value.withRestoredConversation(summary) }
+        assertEquals(loaded.history, state.value.history)
+    }
+
+    @Test
+    fun `真实摘要变化仍丢弃包含中间回复的缓存`() = runTest {
+        val state = state()
+        val summary = state.value
+        state.loadTurnDetails("turn") { listOf(answer, command, answer.copy(id = "commentary", phase = AgentMessagePhase.COMMENTARY)) }
+        val changed = summary.withConversationItem(answer.copy(text = "新的最终结果"), isActive = false)
+        state.value = state.value.withRestoredConversation(changed)
+        assertEquals(changed.history, state.value.history)
+        assertEquals(TurnDetailsState.Unloaded, state.turn.detailsState)
+    }
+
+    @Test
+    fun `请求期间新增中间回复不会让相同摘要重置加载或失败状态`() = runTest {
+        val state = state()
+        val summary = state.value
+        val result = CompletableDeferred<List<ConversationItem>>()
+        val job = launch { state.loadTurnDetails("turn") { result.await() } }
+        runCurrent()
+        state.value = state.value.withConversationItem(
+            answer.copy(id = "commentary", phase = AgentMessagePhase.COMMENTARY), isActive = false,
+        )
+        val loading = state.turn.detailsState
+        state.value = state.value.withRestoredConversation(summary)
+        assertTrue(state.turn.detailsState === loading)
+        result.completeExceptionally(IllegalStateException("读取失败"))
+        job.join()
+        val failed = state.turn.detailsState
+        repeat(3) { state.value = state.value.withRestoredConversation(summary) }
+        assertTrue(failed is TurnDetailsState.Failed)
+        assertTrue(state.turn.detailsState === failed)
+    }
+
+    @Test
+    fun `失败后手动重试仍使用原服务端摘要校验缓存`() = runTest {
+        val state = state()
+        val summary = state.value
+        val result = CompletableDeferred<List<ConversationItem>>()
+        val job = launch { state.loadTurnDetails("turn") { result.await() } }
+        runCurrent()
+        val commentary = answer.copy(id = "commentary", phase = AgentMessagePhase.COMMENTARY)
+        state.value = state.value.withConversationItem(commentary, isActive = false)
+        result.completeExceptionally(IllegalStateException("读取失败"))
+        job.join()
+        state.loadTurnDetails("turn") { listOf(answer, command, commentary) }
+        state.value = state.value.withRestoredConversation(summary)
+        assertEquals(TurnDetailsState.Loaded, state.turn.detailsState)
+        assertEquals(listOf(answer, command, commentary), state.turn.items)
     }
 
     @Test

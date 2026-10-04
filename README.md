@@ -107,6 +107,10 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 ## 连接异常排查
 
+若会话被其他 Codex 客户端占用，Android 会以 external-writer 模式查看并自动更新原会话历史。可选的 [Desktop companion](companion/README.md) 支持将文字交给持有原会话的电脑客户端，避免另建对话；当前为实验功能，需要独立部署伴随代理。
+
+同步时直接更新最新回合的完整处理过程；历史回合的详情按需加载并保留缓存。同一服务端摘要不会因为详情中多了中间回复而反复重置加载状态。
+
 生产版本通过 Logcat 的 `CodexConnection` 标签记录连接失败、非主动断开、请求超时和会话恢复失败，正常连接、消息收发和主动取消不记录
 
 ```bash

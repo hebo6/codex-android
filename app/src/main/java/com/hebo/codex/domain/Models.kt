@@ -219,6 +219,11 @@ data class RecentProject(
     val threads: List<ThreadSummary>,
 )
 
+enum class ConversationAccessMode {
+    WRITABLE,
+    EXTERNAL_WRITER,
+}
+
 data class ConversationState(
     val serverId: String,
     val serverName: String,
@@ -250,12 +255,31 @@ data class ConversationState(
     val agentNickname: String? = null,
     val agentRole: String? = null,
     val canAcceptDirectInput: Boolean? = null,
+    val accessMode: ConversationAccessMode = ConversationAccessMode.WRITABLE,
+    val desktopControlAvailable: Boolean = false,
 ) {
     val items: List<ConversationItem>
         get() = history.items
 
     val isViewOnly: Boolean
-        get() = canAcceptDirectInput == false
+        get() = isExternalWriter || canAcceptDirectInput == false
+
+    val isExternalWriter: Boolean
+        get() = accessMode == ConversationAccessMode.EXTERNAL_WRITER
+
+    // Sending through the owner does not grant local Shell, approval or settings access.
+    val canSendToDesktop: Boolean
+        get() = isExternalWriter && desktopControlAvailable && canAcceptDirectInput != false
+
+    val viewOnlyMessage: String?
+        get() = when {
+            isExternalWriter && canAcceptDirectInput == false ->
+                "此子代理正在其他 Codex 客户端中使用，自动更新历史；输入仍由父会话控制"
+            canSendToDesktop -> "已连接此会话的电脑客户端，可在原对话中发送文字。Shell、审批和设置请在电脑端处理"
+            isExternalWriter -> "此会话正在其他 Codex 客户端中使用，当前只读并自动更新历史；释放占用后可在此会话继续发送"
+            canAcceptDirectInput == false -> "此会话当前仅可查看"
+            else -> null
+        }
 }
 
 data class BackgroundTerminal(
@@ -281,6 +305,9 @@ data class ConversationTurn(
     val items: List<ConversationItem> = emptyList(),
     val detailsState: TurnDetailsState = TurnDetailsState.Loaded,
     val error: UserFacingError? = null,
+    // The server summary used to load these details. Full items may contain
+    // commentary/async messages that the server intentionally omits from it.
+    val detailsSummary: List<ConversationItem>? = null,
 )
 
 sealed interface TurnDetailsState {

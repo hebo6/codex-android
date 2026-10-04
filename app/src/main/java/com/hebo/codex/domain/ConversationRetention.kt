@@ -17,10 +17,10 @@ internal class ConversationLeaseRegistry<K> {
 }
 
 internal val ConversationState.requiresRuntimeRetention: Boolean
-    get() = isRunning ||
+    get() = !isExternalWriter && (isRunning ||
         activeTurnId != null ||
         pendingRequests.isNotEmpty() ||
-        backgroundTerminals.isNotEmpty()
+        backgroundTerminals.isNotEmpty())
 
 internal fun ConversationState.withActiveTurnPlan(plan: ActiveTurnPlan): ConversationState =
     if (plan.turnId == activeTurnId) copy(plan = plan) else this

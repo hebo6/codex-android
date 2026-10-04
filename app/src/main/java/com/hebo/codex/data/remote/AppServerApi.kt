@@ -160,6 +160,7 @@ class AppServerApi(
         StableRpcMethod.THREAD_READ,
         buildJsonObject {
             put("threadId", threadId)
+            put("includeTurns", false)
         },
     ).jsonObject
 
@@ -212,6 +213,39 @@ class AppServerApi(
         buildTurnParams(threadId, clientMessageId, input, options),
         timeoutMillis = input.submissionTimeoutMillis(),
     ).jsonObject
+
+    // Optional codex-android companion extension, separate from Codex CLI RPCs.
+    suspend fun discoverDesktopControl(threadId: String): Boolean = try {
+        val result = connection.request(
+            "codexAndroid/desktop/discover",
+            buildJsonObject { put("threadId", threadId) },
+        ).jsonObject
+        if (result.requiredString("threadId") != threadId || result.requiredInt("protocolVersion") != 1) {
+            throw ProtocolException("电脑伴随服务的会话或协议不匹配")
+        }
+        result.requiredBoolean("available")
+    } catch (error: RpcException) {
+        val unsupported = error.code == -32601 || (error.code == -32600 &&
+            error.message.startsWith("Invalid request: unknown variant `codexAndroid/desktop/discover`"))
+        if (!unsupported) throw error
+        false
+    }
+
+    suspend fun sendDesktopMessage(threadId: String, clientMessageId: String, text: String): JsonObject =
+        connection.request(
+            "codexAndroid/desktop/turn/start",
+            buildJsonObject {
+                put("threadId", threadId)
+                put("clientUserMessageId", clientMessageId)
+                put("text", text)
+            },
+            timeoutMillis = 120_000,
+        ).jsonObject.also { result ->
+            if (result.requiredString("threadId") != threadId ||
+                result.requiredString("clientUserMessageId") != clientMessageId
+            ) throw ProtocolException("电脑端的发送确认与当前消息不一致")
+            result.requiredObject("turn").requiredString("id")
+        }
 
     suspend fun steerTurn(
         threadId: String,
